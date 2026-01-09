@@ -20,7 +20,7 @@ Requirements:
 import os
 import sys
 import re
-from typing import List, Optional, Tuple
+from typing import Optional
 
 try:
     from google.oauth2.credentials import Credentials
@@ -43,11 +43,14 @@ SCOPES = [
 
 # Spreadsheet ID from the URL
 # URL format: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit
-SPREADSHEET_ID = '1u1W9nV26a8-nvEx8R_bN6tEm3PrK6Z3O6A2YYXlPSLw'
+SPREADSHEET_ID = '13Ot6VJVZbEp6Hv27uDQnuMsFHsAOsgT1xZWqxAdG6KI'
 
-# Column indices (A=0, B=1, ..., R=17, S=18)
-R_COLUMN = 17  # Column R (0-indexed)
-S_COLUMN = 18  # Column S (0-indexed)
+# Column letters (R=18th column, S=19th column)
+DOC_LINK_COL = "R"  # Google Doc links in column R
+OUTPUT_COL = "S"    # Output content in column S
+
+# Batch write size: write every N documents to balance speed and real-time progress
+BATCH_SIZE = 5  # Write every 5 documents (set to 1 for immediate write, larger for faster)
 
 # Token file to store credentials
 TOKEN_FILE = 'google_api_token.pickle'
@@ -84,100 +87,66 @@ def get_credentials():
     return creds
 
 
-def extract_doc_id_from_url(url: str) -> Optional[str]:
+def extract_doc_id(url: str) -> Optional[str]:
     """
-    Extract Google Doc ID from various URL formats.
-    Examples:
-    - https://docs.google.com/document/d/DOC_ID/edit
-    - https://docs.google.com/document/d/DOC_ID/view
-    - https://docs.google.com/document/d/DOC_ID
+    Extract Google Doc ID from URL.
+    Supports: https://docs.google.com/document/d/<DOC_ID>/edit
     """
     if not url or not isinstance(url, str):
         return None
     
-    # Pattern to match Google Doc URLs
-    patterns = [
-        r'docs\.google\.com/document/d/([a-zA-Z0-9_-]+)',
-        r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)',
-    ]
+    url = url.strip()
     
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    # Simple pattern matching
+    m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    
+    # Also try drive.google.com format
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    
+    # If it looks like just an ID (alphanumeric, 25-60 chars)
+    if re.match(r'^[a-zA-Z0-9_-]{25,60}$', url):
+        return url
     
     return None
 
 
-def get_doc_content(docs_service, doc_id: str) -> Optional[str]:
-    """Get the plain text content from a Google Doc."""
+def read_doc_text(docs_service, doc_id: str) -> Optional[str]:
+    """Get plain text content from a Google Doc."""
     try:
         doc = docs_service.documents().get(documentId=doc_id).execute()
+        content = doc.get("body", {}).get("content", [])
         
-        # Extract text from document elements
-        content_parts = []
-        last_element_type = None
+        text = []
+        for element in content:
+            if "paragraph" in element:
+                for run in element["paragraph"].get("elements", []):
+                    if "textRun" in run:
+                        text.append(run["textRun"].get("content", ""))
+            elif "table" in element:
+                # Extract text from tables
+                table = element["table"]
+                if "tableRows" in table:
+                    for row in table["tableRows"]:
+                        if "tableCells" in row:
+                            row_texts = []
+                            for cell in row["tableCells"]:
+                                cell_text = []
+                                if "content" in cell:
+                                    for cell_elem in cell["content"]:
+                                        if "paragraph" in cell_elem:
+                                            for para_elem in cell_elem["paragraph"].get("elements", []):
+                                                if "textRun" in para_elem:
+                                                    cell_text.append(para_elem["textRun"].get("content", ""))
+                                row_texts.append(" ".join(cell_text).strip())
+                            if row_texts:
+                                text.append("\t".join(row_texts))
+                                text.append("\n")
         
-        def extract_text_from_paragraph(para):
-            """Extract text from a paragraph element."""
-            if 'elements' not in para:
-                return
-            
-            for elem in para['elements']:
-                if 'textRun' in elem:
-                    text = elem['textRun'].get('content', '')
-                    content_parts.append(text)
-        
-        def extract_text_from_table(table):
-            """Extract text from a table element."""
-            if 'tableRows' not in table:
-                return
-            
-            for row in table['tableRows']:
-                if 'tableCells' not in row:
-                    continue
-                
-                row_texts = []
-                for cell in row['tableCells']:
-                    if 'content' in cell:
-                        cell_texts = []
-                        for cell_elem in cell['content']:
-                            if 'paragraph' in cell_elem:
-                                para = cell_elem['paragraph']
-                                if 'elements' in para:
-                                    for para_elem in para['elements']:
-                                        if 'textRun' in para_elem:
-                                            cell_texts.append(para_elem['textRun'].get('content', ''))
-                        row_texts.append(' '.join(cell_texts).strip())
-                
-                # Join cell texts with tab, then add newline
-                if row_texts:
-                    content_parts.append('\t'.join(row_texts))
-                    content_parts.append('\n')
-        
-        # Process document body
-        if 'body' in doc and 'content' in doc['body']:
-            for element in doc['body']['content']:
-                if 'paragraph' in element:
-                    # Add newline between paragraphs (but not first one)
-                    if last_element_type == 'paragraph':
-                        content_parts.append('\n')
-                    extract_text_from_paragraph(element['paragraph'])
-                    last_element_type = 'paragraph'
-                    
-                elif 'table' in element:
-                    # Add newline before table
-                    if content_parts and content_parts[-1] != '\n':
-                        content_parts.append('\n')
-                    extract_text_from_table(element['table'])
-                    last_element_type = 'table'
-        
-        # Join and clean up content
-        content = ''.join(content_parts)
-        # Remove excessive newlines (more than 2 consecutive)
-        content = re.sub(r'\n{3,}', '\n\n', content)
-        return content.strip()
-    
+        return "".join(text).strip()
     except HttpError as e:
         print(f"[ERROR] Failed to get document {doc_id}: {e}", file=sys.stderr)
         return None
@@ -186,78 +155,86 @@ def get_doc_content(docs_service, doc_id: str) -> Optional[str]:
         return None
 
 
-def column_index_to_letter(column_index: int) -> str:
-    """Convert 0-based column index to A1 notation letter(s)."""
-    result = ""
-    column_index += 1  # Convert to 1-based
-    while column_index > 0:
-        column_index -= 1
-        result = chr(65 + (column_index % 26)) + result
-        column_index //= 26
-    return result
-
-
-def get_column_data(sheets_service, sheet_name: str, column_index: int) -> List[Tuple[int, str]]:
-    """Get all values from a specific column, returning (row_index, value) pairs."""
+def get_hyperlinks_from_column(sheets_service, spreadsheet_id: str, sheet_name: str, column: str, start_row: int = 2):
+    """
+    Get hyperlinks from a column in Google Sheets.
+    Returns a list of URLs (or None if cell has no hyperlink).
+    """
+    # Get sheet ID first
+    spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    for sheet in spreadsheet['sheets']:
+        if sheet['properties']['title'] == sheet_name:
+            sheet_id = sheet['properties']['sheetId']
+            break
+    
+    if sheet_id is None:
+        raise ValueError(f"Sheet '{sheet_name}' not found")
+    
+    # Read a large range to get all data with hyperlinks
+    # We'll use get with includeGridData to get hyperlink information
+    range_str = f"{sheet_name}!{column}{start_row}:{column}"
     try:
-        # Get all values in the column using A1 notation
-        column_letter = column_index_to_letter(column_index)
-        range_name = f"{sheet_name}!{column_letter}:{column_letter}"
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=range_name
+        # First get values to know how many rows
+        values_result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_str
+        ).execute()
+        num_rows = len(values_result.get("values", []))
+        
+        if num_rows == 0:
+            return []
+        
+        # Now get the grid data with hyperlinks
+        result = sheets_service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            ranges=[f"{sheet_name}!{column}{start_row}:{column}{start_row + num_rows - 1}"],
+            includeGridData=True
         ).execute()
         
-        values = result.get('values', [])
+        hyperlinks = []
+        rows_data = result['sheets'][0]['data'][0].get('rowData', [])
         
-        # Return list of (row_index, value) tuples, skipping header row (index 0)
-        data = []
-        for i, row in enumerate(values):
-            if i == 0:  # Skip header row
+        for row_data in rows_data:
+            if not row_data.get('values') or len(row_data['values']) == 0:
+                hyperlinks.append(None)
                 continue
-            value = row[0] if row else ''
-            data.append((i + 1, value))  # +1 because row indices in Sheets API start at 1
+            
+            cell = row_data['values'][0]
+            # Try to get hyperlink from different possible locations
+            hyperlink = None
+            
+            # Check userEnteredFormat.textFormat.link
+            if 'userEnteredFormat' in cell:
+                format_info = cell['userEnteredFormat']
+                if 'textFormat' in format_info and 'link' in format_info['textFormat']:
+                    hyperlink = format_info['textFormat']['link'].get('uri')
+            
+            # Check hyperlink property directly
+            if not hyperlink and 'hyperlink' in cell:
+                hyperlink = cell['hyperlink']
+            
+            # Check hyperlinkDisplayType (this means cell has hyperlink)
+            if not hyperlink and 'userEnteredFormat' in cell:
+                if 'textFormat' in cell['userEnteredFormat']:
+                    text_format = cell['userEnteredFormat']['textFormat']
+                    # If hyperlinkDisplayType exists, try to reconstruct from formattedValue
+                    if 'link' in text_format:
+                        hyperlink = text_format['link'].get('uri')
+            
+            # Fallback: if cell value looks like a URL, use it
+            if not hyperlink and 'formattedValue' in cell:
+                value = cell['formattedValue']
+                if value and ('http://' in value or 'https://' in value):
+                    hyperlink = value
+            
+            hyperlinks.append(hyperlink)
         
-        return data
+        return hyperlinks
     
     except HttpError as e:
-        print(f"[ERROR] Failed to read column data: {e}", file=sys.stderr)
-        return []
-
-
-def update_column_data(sheets_service, sheet_name: str, column_index: int, updates: List[Tuple[int, str]]):
-    """Update specific cells in a column."""
-    if not updates:
-        return
-    
-    try:
-        # Prepare update requests
-        values = []
-        column_letter = column_index_to_letter(column_index)
-        for row_index, value in updates:
-            # Convert row index to A1 notation (row_index is already 1-based from get_column_data)
-            cell_range = f"{sheet_name}!{column_letter}{row_index}"
-            values.append({
-                'range': cell_range,
-                'values': [[value]]  # Wrap in nested list for batch update
-            })
-        
-        # Batch update
-        body = {
-            'valueInputOption': 'RAW',
-            'data': values
-        }
-        
-        result = sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body=body
-        ).execute()
-        
-        updated = result.get('totalUpdatedCells', 0)
-        print(f"[INFO] Updated {updated} cells in column {column_letter}")
-    
-    except HttpError as e:
-        print(f"[ERROR] Failed to update column data: {e}", file=sys.stderr)
+        print(f"[ERROR] Failed to read hyperlinks from column {column}: {e}", file=sys.stderr)
+        raise
 
 
 def main():
@@ -270,8 +247,7 @@ def main():
     sheets_service = build('sheets', 'v4', credentials=creds)
     docs_service = build('docs', 'v1', credentials=creds)
     
-    # Get sheet name (you may need to adjust this)
-    # Try to get the first sheet, or you can specify the sheet name
+    # Get sheet name (use first sheet by default)
     try:
         spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         sheet_name = spreadsheet['sheets'][0]['properties']['title']
@@ -280,42 +256,106 @@ def main():
         print(f"[ERROR] Failed to get sheet name: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Get all URLs from column R
-    print(f"[INFO] Reading URLs from column R...")
-    r_column_data = get_column_data(sheets_service, sheet_name, R_COLUMN)
+    # Read all hyperlinks from column R (starting from row 2 to skip header)
+    print(f"[INFO] Reading hyperlinks from column {DOC_LINK_COL}...")
+    try:
+        hyperlinks = get_hyperlinks_from_column(sheets_service, SPREADSHEET_ID, sheet_name, DOC_LINK_COL, start_row=2)
+    except Exception as e:
+        print(f"[ERROR] Failed to read hyperlinks: {e}", file=sys.stderr)
+        sys.exit(1)
     
-    print(f"[INFO] Found {len(r_column_data)} rows with data in column R")
+    print(f"[INFO] Found {len(hyperlinks)} rows in column {DOC_LINK_COL}")
     
-    # Process each URL and extract content
-    updates = []
-    for row_index, url in r_column_data:
-        if not url or not url.strip():
-            print(f"[INFO] Row {row_index + 1}: Empty URL, skipping...")
-            continue
+    # Process each hyperlink and extract content, write in batches
+    processed_count = 0
+    updates = []  # Batch updates: [(row_index, value), ...]
+    
+    def flush_updates(updates_list):
+        """Write accumulated updates to spreadsheet."""
+        if not updates_list:
+            return
         
-        print(f"[INFO] Row {row_index + 1}: Processing URL: {url[:80]}...")
+        # Prepare batch update
+        batch_data = []
+        for row_idx, value in updates_list:
+            batch_data.append({
+                'range': f"{sheet_name}!{OUTPUT_COL}{row_idx}",
+                'values': [[value]]
+            })
         
-        # Extract document ID from URL
-        doc_id = extract_doc_id_from_url(url)
-        if not doc_id:
-            print(f"[WARN] Row {row_index + 1}: Could not extract document ID from URL")
-            continue
+        try:
+            body = {
+                'valueInputOption': 'RAW',
+                'data': batch_data
+            }
+            sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body=body
+            ).execute()
+            print(f"[INFO] Wrote batch of {len(updates_list)} rows to column {OUTPUT_COL}")
+        except HttpError as e:
+            print(f"[ERROR] Failed to write batch: {e}", file=sys.stderr)
+            # Try individual writes as fallback
+            for row_idx, value in updates_list:
+                try:
+                    sheets_service.spreadsheets().values().update(
+                        spreadsheetId=SPREADSHEET_ID,
+                        range=f"{sheet_name}!{OUTPUT_COL}{row_idx}",
+                        valueInputOption="RAW",
+                        body={"values": [[value]]}
+                    ).execute()
+                except HttpError as err:
+                    print(f"[ERROR] Row {row_idx}: Failed to write: {err}", file=sys.stderr)
+    
+    for i, hyperlink in enumerate(hyperlinks, start=2):
+        value_to_write = ""
         
-        # Get document content
-        content = get_doc_content(docs_service, doc_id)
-        if content:
-            print(f"[INFO] Row {row_index + 1}: Extracted {len(content)} characters")
-            updates.append((row_index, content))
+        if hyperlink is None:
+            # No hyperlink, write empty string
+            value_to_write = ""
         else:
-            print(f"[WARN] Row {row_index + 1}: Failed to extract content")
+            link = hyperlink.strip() if hyperlink else ""
+            if not link:
+                value_to_write = ""
+            else:
+                print(f"[INFO] Row {i}: Processing URL: {link[:80]}...")
+                
+                # Extract document ID
+                doc_id = extract_doc_id(link)
+                if not doc_id:
+                    print(f"[WARN] Row {i}: Could not extract document ID from URL")
+                    print(f"[DEBUG] Full URL: {repr(link)}")
+                    value_to_write = "INVALID LINK"
+                else:
+                    # Get document content
+                    try:
+                        text = read_doc_text(docs_service, doc_id)
+                        if text:
+                            print(f"[INFO] Row {i}: Extracted {len(text)} characters")
+                            value_to_write = text
+                            processed_count += 1
+                        else:
+                            print(f"[WARN] Row {i}: Failed to extract content")
+                            value_to_write = "ERROR: Failed to extract content"
+                    except Exception as e:
+                        error_msg = f"ERROR: {str(e)}"
+                        print(f"[ERROR] Row {i}: {error_msg}")
+                        value_to_write = error_msg
+        
+        # Add to batch
+        updates.append((i, value_to_write))
+        
+        # Flush batch when it reaches BATCH_SIZE
+        if len(updates) >= BATCH_SIZE:
+            flush_updates(updates)
+            updates = []
     
-    # Update column S with extracted content
+    # Flush remaining updates
     if updates:
-        print(f"\n[INFO] Updating column S with {len(updates)} extracted contents...")
-        update_column_data(sheets_service, sheet_name, S_COLUMN, updates)
-        print("[INFO] Done!")
-    else:
-        print("[WARN] No content extracted, nothing to update")
+        flush_updates(updates)
+    
+    print(f"\n[INFO] Processed {processed_count} documents successfully")
+    print("[INFO] Done!")
 
 
 if __name__ == '__main__':
